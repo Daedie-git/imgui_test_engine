@@ -1475,10 +1475,13 @@ static bool ImGuiApp_ImplGL_CaptureFramebuffer(ImGuiViewport* viewport, int x, i
 // [SECTION] Mock backend for multi-viewports (Shared): The viewports are not visible
 //-----------------------------------------------------------------------------
 
-// FIXME: Add OS/WM emulating feature: resist moving.
-// FIXME: Add OS/WM emulating feature: resist resizing.
-
 #ifdef IMGUI_HAS_VIEWPORT
+
+enum ImGui_ImplMockViewport_GeometryType
+{
+    ImGui_ImplMockViewport_GeometryType_Pos,
+    ImGui_ImplMockViewport_GeometryType_Size
+};
 
 // A virtual window
 struct ImGui_ImplMockViewport_ViewportData
@@ -1486,14 +1489,35 @@ struct ImGui_ImplMockViewport_ViewportData
     ImGuiID     ID = 0;
     ImVec2      Pos;
     ImVec2      Size;
+    int         SetWindowPosCount = 0;
+    int         SetWindowSizeCount = 0;
     char        Title[256] = ""; // There's no getter so we don't mind if the title is truncated
+};
+
+struct ImGui_ImplMockViewport_Response
+{
+    ImGuiID                             ViewportID = 0;
+    ImGui_ImplMockViewport_GeometryType Type = ImGui_ImplMockViewport_GeometryType_Pos;
+    ImGuiAppMockViewportResponse        Response;
+};
+
+struct ImGui_ImplMockViewport_Event
+{
+    ImGuiID                             ViewportID = 0;
+    ImGui_ImplMockViewport_GeometryType Type = ImGui_ImplMockViewport_GeometryType_Pos;
+    int                                 DueFrame = 0;
+    bool                                ApplyValue = true;
+    ImVec2                              Value;
 };
 
 struct ImGui_ImplMockViewport_Data
 {
     ImVector<ImGui_ImplMockViewport_ViewportData>   MockViewports;  // We can't store in viewport->PlatformUserData to allow combining with real backends.
+    ImVector<ImGui_ImplMockViewport_Response>       Responses;
+    ImVector<ImGui_ImplMockViewport_Event>          Events;
     ImGuiID                                         FocusedViewportId = 0;
     ImGuiPlatformIO                                 OriginalPlatformIO;
+    int                                             FrameCount = 0;
 };
 
 static ImGui_ImplMockViewport_Data g_NullViewportBackendData;
@@ -1511,6 +1535,133 @@ static ImGui_ImplMockViewport_ViewportData* ImGui_ImplNullViewport_FindViewportD
     return NULL;
 }
 
+static ImGui_ImplMockViewport_ViewportData* ImGui_ImplNullViewport_FindViewportData(ImGui_ImplMockViewport_Data* bd, ImGuiID viewport_id)
+{
+    for (ImGui_ImplMockViewport_ViewportData& vd : bd->MockViewports)
+        if (vd.ID == viewport_id)
+            return &vd;
+    return NULL;
+}
+
+static void ImGui_ImplMockViewport_DeliverEvent(ImGui_ImplMockViewport_Data* bd, const ImGui_ImplMockViewport_Event& event)
+{
+    ImGui_ImplMockViewport_ViewportData* vd = ImGui_ImplNullViewport_FindViewportData(bd, event.ViewportID);
+    if (vd == NULL)
+        return;
+    if (event.ApplyValue)
+    {
+        if (event.Type == ImGui_ImplMockViewport_GeometryType_Pos)
+            vd->Pos = event.Value;
+        else
+            vd->Size = event.Value;
+    }
+    if (ImGuiViewport* viewport = ImGui::FindViewportByID(event.ViewportID))
+    {
+        if (event.Type == ImGui_ImplMockViewport_GeometryType_Pos)
+            viewport->PlatformRequestMove = true;
+        else
+            viewport->PlatformRequestResize = true;
+    }
+}
+
+static void ImGui_ImplMockViewport_QueueSetterResponse(ImGui_ImplMockViewport_Data* bd, ImGuiViewport* viewport, ImGui_ImplMockViewport_GeometryType type, const ImVec2& requested_value)
+{
+    ImGui_ImplMockViewport_Response* queued_response = NULL;
+    for (ImGui_ImplMockViewport_Response& response : bd->Responses)
+        if (response.ViewportID == viewport->ID && response.Type == type)
+        {
+            queued_response = &response;
+            break;
+        }
+
+    // Preserve the original mock behavior unless a test explicitly queues a response.
+    ImGui_ImplMockViewport_ViewportData* vd = ImGui_ImplNullViewport_FindViewportData(bd, viewport);
+    if (queued_response == NULL)
+    {
+        if (type == ImGui_ImplMockViewport_GeometryType_Pos)
+            vd->Pos = requested_value;
+        else
+            vd->Size = requested_value;
+        return;
+    }
+
+    ImGui_ImplMockViewport_Event event;
+    event.ViewportID = viewport->ID;
+    event.Type = type;
+    event.DueFrame = bd->FrameCount + queued_response->Response.DelayFrames;
+    event.ApplyValue = queued_response->Response.ApplyValue;
+    event.Value = queued_response->Response.ApplyRequestedValue ? requested_value : queued_response->Response.Value;
+    bd->Responses.erase(queued_response);
+    if (event.DueFrame <= bd->FrameCount)
+        ImGui_ImplMockViewport_DeliverEvent(bd, event);
+    else
+        bd->Events.push_back(event);
+}
+
+static void ImGui_ImplMockViewport_NewFrameHook(ImGuiContext*, ImGuiContextHook*)
+{
+    ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
+    bd->FrameCount++;
+    for (int event_n = 0; event_n < bd->Events.Size;)
+    {
+        if (bd->Events[event_n].DueFrame > bd->FrameCount)
+        {
+            event_n++;
+            continue;
+        }
+        ImGui_ImplMockViewport_Event event = bd->Events[event_n];
+        bd->Events.erase(bd->Events.Data + event_n);
+        ImGui_ImplMockViewport_DeliverEvent(bd, event);
+    }
+}
+
+void ImGuiApp_MockViewport_QueueWindowPosResponse(ImGuiID viewport_id, const ImGuiAppMockViewportResponse& response)
+{
+    ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
+    ImGui_ImplMockViewport_Response queued_response;
+    queued_response.ViewportID = viewport_id;
+    queued_response.Type = ImGui_ImplMockViewport_GeometryType_Pos;
+    queued_response.Response = response;
+    bd->Responses.push_back(queued_response);
+}
+
+void ImGuiApp_MockViewport_QueueWindowSizeResponse(ImGuiID viewport_id, const ImGuiAppMockViewportResponse& response)
+{
+    ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
+    ImGui_ImplMockViewport_Response queued_response;
+    queued_response.ViewportID = viewport_id;
+    queued_response.Type = ImGui_ImplMockViewport_GeometryType_Size;
+    queued_response.Response = response;
+    bd->Responses.push_back(queued_response);
+}
+
+bool ImGuiApp_MockViewport_GetState(ImGuiID viewport_id, ImGuiAppMockViewportState* out_state)
+{
+    ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
+    ImGui_ImplMockViewport_ViewportData* vd = ImGui_ImplNullViewport_FindViewportData(bd, viewport_id);
+    if (vd == NULL)
+        return false;
+    out_state->Pos = vd->Pos;
+    out_state->Size = vd->Size;
+    out_state->SetWindowPosCount = vd->SetWindowPosCount;
+    out_state->SetWindowSizeCount = vd->SetWindowSizeCount;
+    return true;
+}
+
+void ImGuiApp_MockViewport_ClearResponses()
+{
+    ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
+    bd->Responses.resize(0);
+    bd->Events.resize(0);
+}
+
+void ImGuiApp_MockViewport_ResetCounters(ImGuiID viewport_id)
+{
+    ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
+    if (ImGui_ImplMockViewport_ViewportData* vd = ImGui_ImplNullViewport_FindViewportData(bd, viewport_id))
+        vd->SetWindowPosCount = vd->SetWindowSizeCount = 0;
+}
+
 // Mock backend (viewports not visible)
 static void ImGuiApp_InstallMockViewportsBackend(ImGuiApp*)
 {
@@ -1518,6 +1669,11 @@ static void ImGuiApp_InstallMockViewportsBackend(ImGuiApp*)
 
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
     ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
+    bd->MockViewports.resize(0);
+    bd->Responses.resize(0);
+    bd->Events.resize(0);
+    bd->FocusedViewportId = 0;
+    bd->FrameCount = 0;
     bd->OriginalPlatformIO = platform_io;
 #if IMGUI_VERSION_NUM >= 19231
     platform_io.ClearPlatformHandlers();
@@ -1550,6 +1706,11 @@ static void ImGuiApp_InstallMockViewportsBackend(ImGuiApp*)
         bd->MockViewports.push_back(vd);
     }
 
+    ImGuiContextHook hook;
+    hook.Type = ImGuiContextHookType_NewFramePre;
+    hook.Callback = ImGui_ImplMockViewport_NewFrameHook;
+    ImGui::AddContextHook(ImGui::GetCurrentContext(), &hook);
+
     platform_io.Platform_CreateWindow = [](ImGuiViewport* viewport)
     {
         ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
@@ -1564,6 +1725,12 @@ static void ImGuiApp_InstallMockViewportsBackend(ImGuiApp*)
         ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
         if (ImGui_ImplMockViewport_ViewportData* vd = ImGui_ImplNullViewport_FindViewportData(bd, viewport))
             bd->MockViewports.erase(vd);
+        for (int response_n = bd->Responses.Size - 1; response_n >= 0; response_n--)
+            if (bd->Responses[response_n].ViewportID == viewport->ID)
+                bd->Responses.erase(bd->Responses.Data + response_n);
+        for (int event_n = bd->Events.Size - 1; event_n >= 0; event_n--)
+            if (bd->Events[event_n].ViewportID == viewport->ID)
+                bd->Events.erase(bd->Events.Data + event_n);
 
         // Transfer focus to previous viewport
         if (bd->FocusedViewportId == viewport->ID)
@@ -1587,7 +1754,10 @@ static void ImGuiApp_InstallMockViewportsBackend(ImGuiApp*)
     {
         ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
         if (ImGui_ImplMockViewport_ViewportData* vd = ImGui_ImplNullViewport_FindViewportData(bd, viewport))
-            vd->Pos = pos;
+        {
+            vd->SetWindowPosCount++;
+            ImGui_ImplMockViewport_QueueSetterResponse(bd, viewport, ImGui_ImplMockViewport_GeometryType_Pos, pos);
+        }
     };
     platform_io.Platform_GetWindowPos = [](ImGuiViewport* viewport)
     {
@@ -1604,7 +1774,10 @@ static void ImGuiApp_InstallMockViewportsBackend(ImGuiApp*)
     {
         ImGui_ImplMockViewport_Data* bd = ImGui_ImplNullViewport_GetBackendData();
         if (ImGui_ImplMockViewport_ViewportData* vd = ImGui_ImplNullViewport_FindViewportData(bd, viewport))
-            vd->Size = size;
+        {
+            vd->SetWindowSizeCount++;
+            ImGui_ImplMockViewport_QueueSetterResponse(bd, viewport, ImGui_ImplMockViewport_GeometryType_Size, size);
+        }
     };
     platform_io.Platform_GetWindowSize = [](ImGuiViewport* viewport)
     {

@@ -42,6 +42,32 @@ struct ImGuiApp
     bool    (*CaptureFramebuffer)(ImGuiApp* app, ImGuiViewport* viewport, int x, int y, int w, int h, unsigned int* pixels_rgba, void* user_data) = nullptr;
 };
 
+#ifdef IMGUI_HAS_VIEWPORT
+// Test controls for the mock viewport backend. They emulate asynchronous window-manager
+// responses while keeping requested and observed platform geometry separate.
+struct ImGuiAppMockViewportResponse
+{
+    int     DelayFrames = 0;               // 0: respond from the setter, 1+: respond before a later ImGui::NewFrame().
+    bool    ApplyRequestedValue = false;   // Use the value passed to the platform setter instead of Value.
+    bool    ApplyValue = true;              // False models a rejected request which leaves platform geometry unchanged.
+    ImVec2  Value = ImVec2(0.0f, 0.0f);
+};
+
+struct ImGuiAppMockViewportState
+{
+    ImVec2  Pos;
+    ImVec2  Size;
+    int     SetWindowPosCount = 0;
+    int     SetWindowSizeCount = 0;
+};
+
+void    ImGuiApp_MockViewport_QueueWindowPosResponse(ImGuiID viewport_id, const ImGuiAppMockViewportResponse& response);
+void    ImGuiApp_MockViewport_QueueWindowSizeResponse(ImGuiID viewport_id, const ImGuiAppMockViewportResponse& response);
+bool    ImGuiApp_MockViewport_GetState(ImGuiID viewport_id, ImGuiAppMockViewportState* out_state);
+void    ImGuiApp_MockViewport_ClearResponses();
+void    ImGuiApp_MockViewport_ResetCounters(ImGuiID viewport_id);
+#endif
+
 // Helper stub to store directly in ImGuiTestEngineIO::ScreenCaptureFunc when using test engine (prototype is same as ImGuiScreenCaptureFunc)
 bool ImGuiApp_ScreenCaptureFunc(ImGuiID viewport_id, int x, int y, int w, int h, unsigned int* pixels, void* user_data);
 

@@ -9,6 +9,7 @@
 #include "imgui_test_engine/imgui_te_engine.h"      // IM_REGISTER_TEST()
 #include "imgui_test_engine/imgui_te_context.h"
 #include "imgui_test_engine/thirdparty/Str/Str.h"
+#include "shared/imgui_app.h"
 
 // Warnings
 #ifdef _MSC_VER
@@ -114,6 +115,225 @@ void RegisterTests_Viewports(ImGuiTestEngine* e)
         vars.Count = 0;
         ctx->WindowMove("", main_viewport->WorkPos + ImVec2(100.0f, 100.0f));
         IM_CHECK_NE(window->Pos, main_viewport->WorkPos + ImVec2(100.0f, 100.0f));
+    };
+
+    // ## Test synchronization when an asynchronous platform backend adjusts requested geometry.
+    // This uses the mock backend's requested/observed geometry split to emulate a window manager.
+    t = IM_REGISTER_TEST(e, "viewport", "viewport_platform_geometry_sync");
+    t->GuiFunc = [](ImGuiTestContext*)
+    {
+        ImGui::SetNextWindowSize(ImVec2(240.0f, 180.0f), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Geometry Sync Window", NULL, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking);
+        ImGui::TextUnformatted("Mock platform geometry synchronization");
+        ImGui::End();
+    };
+    struct ViewportGeometrySyncVars
+    {
+        bool MockActive = false;
+        bool MouseHeld = false;
+        bool ConfigNoAutoMergeBackup = false;
+    };
+    t->SetVarsDataType<ViewportGeometrySyncVars>();
+    t->TeardownFunc = [](ImGuiTestContext* ctx)
+    {
+        ViewportGeometrySyncVars& vars = ctx->GetVars<ViewportGeometrySyncVars>();
+        ImGuiApp_MockViewport_ClearResponses();
+        if (vars.MouseHeld)
+            ctx->MouseUp(0);
+        if (vars.MockActive)
+            ctx->UiContext->IO.ConfigViewportsNoAutoMerge = vars.ConfigNoAutoMergeBackup;
+    };
+    t->TestFunc = [](ImGuiTestContext* ctx)
+    {
+        ImGuiContext& g = *ctx->UiContext;
+        ViewportGeometrySyncVars& vars = ctx->GetVars<ViewportGeometrySyncVars>();
+        ImGuiViewport* main_viewport = ImGui::GetMainViewport();
+        ImGuiWindow* window = ctx->GetWindowByRef("//Geometry Sync Window");
+        ImGuiAppMockViewportState state;
+        if (!ImGuiApp_MockViewport_GetState(main_viewport->ID, &state))
+        {
+            ctx->LogInfo("Skipping: test requires -viewport-mock.");
+            return; // This test is meaningful only with -viewport-mock.
+        }
+
+        vars.MockActive = true;
+        vars.ConfigNoAutoMergeBackup = g.IO.ConfigViewportsNoAutoMerge;
+        g.IO.ConfigViewportsNoAutoMerge = true;
+        ctx->Yield();
+        ctx->WindowMove(window->ID, main_viewport->Pos + ImVec2(300.0f, 200.0f));
+        IM_CHECK(window->Viewport != main_viewport);
+        IM_CHECK(window->ViewportOwned);
+        ImGuiViewportP* viewport = window->Viewport;
+
+        IM_CHECK(ImGuiApp_MockViewport_GetState(viewport->ID, &state));
+
+        auto check_synchronized_pos = [&](const ImVec2& expected_pos)
+        {
+            IM_CHECK(ImGuiApp_MockViewport_GetState(viewport->ID, &state));
+            IM_CHECK_EQ(state.Pos, expected_pos);
+            IM_CHECK_EQ(viewport->Pos, expected_pos);
+            IM_CHECK_EQ(window->Pos, expected_pos);
+            IM_CHECK_EQ(viewport->LastPlatformPos, expected_pos);
+        };
+        auto check_synchronized_size = [&](const ImVec2& expected_size)
+        {
+            IM_CHECK(ImGuiApp_MockViewport_GetState(viewport->ID, &state));
+            IM_CHECK_EQ(state.Size, expected_size);
+            IM_CHECK_EQ(viewport->Size, expected_size);
+            IM_CHECK_EQ(window->Size, expected_size);
+            IM_CHECK_EQ(viewport->LastPlatformSize, expected_size);
+        };
+
+        // A synchronous adjusted callback raised from inside Platform_SetWindowPos() must survive UpdatePlatformWindows().
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 requested_pos = viewport->Pos + ImVec2(80.0f, 40.0f);
+            const ImVec2 adjusted_pos = viewport->Pos + ImVec2(25.0f, 15.0f);
+            ImGuiAppMockViewportResponse response;
+            response.DelayFrames = 0;
+            response.Value = adjusted_pos;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, response);
+            ImGui::SetWindowPos(window, requested_pos);
+            ctx->Yield(3);
+            check_synchronized_pos(adjusted_pos);
+            IM_CHECK_EQ(state.SetWindowPosCount, 1);
+        }
+
+        // Model X11 delivery from a later event poll: the adjusted position becomes authoritative without setter ping-pong.
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 requested_pos = viewport->Pos + ImVec2(90.0f, 50.0f);
+            const ImVec2 adjusted_pos = viewport->Pos + ImVec2(30.0f, 20.0f);
+            ImGuiAppMockViewportResponse response;
+            response.DelayFrames = 2;
+            response.Value = adjusted_pos;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, response);
+            ImGui::SetWindowPos(window, requested_pos);
+            ctx->Yield(4);
+            check_synchronized_pos(adjusted_pos);
+            IM_CHECK_EQ(state.SetWindowPosCount, 1);
+        }
+
+        // X11 specifies a synthetic ConfigureNotify even when a configure request is rejected unchanged.
+        // If the platform backend surfaces that event, core synchronization needs no timeout or polling heuristic.
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 unchanged_pos = viewport->Pos;
+            const ImVec2 requested_pos = unchanged_pos + ImVec2(100.0f, 60.0f);
+            ImGuiAppMockViewportResponse response;
+            response.DelayFrames = 1;
+            response.ApplyValue = false;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, response);
+            ImGui::SetWindowPos(window, requested_pos);
+            ctx->Yield(3);
+            check_synchronized_pos(unchanged_pos);
+            IM_CHECK_EQ(state.SetWindowPosCount, 1);
+        }
+
+        // Two outstanding requests may report in different frames. A stale first response must not permanently
+        // suppress the later authoritative geometry.
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 base_pos = viewport->Pos;
+            const ImVec2 request_1 = base_pos + ImVec2(80.0f, 30.0f);
+            const ImVec2 actual_1 = base_pos + ImVec2(30.0f, 10.0f);
+            const ImVec2 request_2 = base_pos + ImVec2(140.0f, 70.0f);
+            const ImVec2 actual_2 = base_pos + ImVec2(60.0f, 25.0f);
+            ImGuiAppMockViewportResponse response_1;
+            response_1.DelayFrames = 3;
+            response_1.Value = actual_1;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, response_1);
+            ImGui::SetWindowPos(window, request_1);
+            ctx->Yield();
+            ImGuiAppMockViewportResponse response_2;
+            response_2.DelayFrames = 3;
+            response_2.Value = actual_2;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, response_2);
+            ImGui::SetWindowPos(window, request_2);
+            ctx->Yield(6);
+            check_synchronized_pos(actual_2);
+            IM_CHECK_EQ(state.SetWindowPosCount, 2);
+        }
+
+        // Synchronous adjusted size callbacks need the same request-lifetime behavior as position callbacks.
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 requested_size = viewport->Size + ImVec2(80.0f, 60.0f);
+            const ImVec2 adjusted_size = viewport->Size + ImVec2(25.0f, 20.0f);
+            ImGuiAppMockViewportResponse response;
+            response.DelayFrames = 0;
+            response.Value = adjusted_size;
+            ImGuiApp_MockViewport_QueueWindowSizeResponse(viewport->ID, response);
+            ImGui::SetWindowSize(window, requested_size);
+            ctx->Yield(3);
+            check_synchronized_size(adjusted_size);
+            IM_CHECK_EQ(state.SetWindowSizeCount, 1);
+        }
+
+        // Position and size are independent; a delayed constrained size must update the platform viewport once.
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 requested_size = viewport->Size + ImVec2(100.0f, 80.0f);
+            const ImVec2 adjusted_size = viewport->Size + ImVec2(40.0f, 30.0f);
+            ImGuiAppMockViewportResponse response;
+            response.DelayFrames = 1;
+            response.Value = adjusted_size;
+            ImGuiApp_MockViewport_QueueWindowSizeResponse(viewport->ID, response);
+            ImGui::SetWindowSize(window, requested_size);
+            ctx->Yield(3);
+            check_synchronized_size(adjusted_size);
+            IM_CHECK_EQ(state.SetWindowSizeCount, 1);
+        }
+
+        // While dragging, accepting a clamped response must rebase the mutable movement anchor without changing
+        // ActiveIdClickOffset (which is also used to classify docking intent).
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ctx->WindowFocus(window->ID);
+            ctx->MouseSetViewport(window);
+            ctx->MouseMoveToPos(ctx->GetWindowTitlebarPoint(window->ID));
+            vars.MouseHeld = true;
+            ctx->MouseDown(0);
+            if (g.MovingWindow == NULL)
+                ImGui::StartMouseMovingWindow(window); // Focus helpers may relocate an off-main-viewport mock window before the click is processed.
+            IM_CHECK(g.MovingWindow && g.MovingWindow->RootWindowDockTree == window->RootWindowDockTree);
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 original_active_click_offset = g.ActiveIdClickOffset;
+            // Accept X while clamping Y so the platform correction only rebases the rejected axis.
+            const ImVec2 adjusted_pos = viewport->Pos + ImVec2(80.0f, 10.0f);
+            ImGuiAppMockViewportResponse response;
+            response.DelayFrames = 1;
+            response.Value = adjusted_pos;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, response);
+            ctx->MouseMoveToPos(g.IO.MousePos + ImVec2(80.0f, 40.0f));
+            ctx->Yield(2);
+            check_synchronized_pos(adjusted_pos);
+            IM_CHECK_EQ(g.ActiveIdClickOffset, original_active_click_offset);
+            IM_CHECK_EQ(state.SetWindowPosCount, 1);
+
+            // A subsequent mouse delta must continue from the accepted platform position, not snap back to the
+            // rejected request. Keep this behavioral so the test engine remains buildable against older imgui trees.
+            const ImVec2 mouse_delta(12.0f, 7.0f);
+            ImGuiAppMockViewportResponse followup_response;
+            followup_response.DelayFrames = 1;
+            followup_response.ApplyRequestedValue = true;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, followup_response);
+            ctx->MouseMoveToPos(g.IO.MousePos + mouse_delta);
+            ctx->Yield(2);
+            check_synchronized_pos(adjusted_pos + mouse_delta);
+            IM_CHECK_EQ(g.ActiveIdClickOffset, original_active_click_offset);
+            IM_CHECK_EQ(state.SetWindowPosCount, 2);
+            ctx->MouseUp(0);
+            vars.MouseHeld = false;
+        }
+
+        ImGuiApp_MockViewport_ClearResponses();
     };
 
     // ## Test translating cases when hosted by main viewport (or any viewport with ImGuiViewportFlags_CanHostOtherWindows) (#7985)
