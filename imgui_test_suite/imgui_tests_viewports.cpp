@@ -120,20 +120,30 @@ void RegisterTests_Viewports(ImGuiTestEngine* e)
     // ## Test synchronization when an asynchronous platform backend adjusts requested geometry.
     // This uses the mock backend's requested/observed geometry split to emulate a window manager.
     t = IM_REGISTER_TEST(e, "viewport", "viewport_platform_geometry_sync");
-    t->GuiFunc = [](ImGuiTestContext*)
-    {
-        ImGui::SetNextWindowSize(ImVec2(240.0f, 180.0f), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Geometry Sync Window", NULL, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking);
-        ImGui::TextUnformatted("Mock platform geometry synchronization");
-        ImGui::End();
-    };
     struct ViewportGeometrySyncVars
     {
         bool MockActive = false;
         bool MouseHeld = false;
         bool ConfigNoAutoMergeBackup = false;
+        bool SetPosAlways = false;
+        bool SetSizeAlways = false;
+        ImVec2 AlwaysPos;
+        ImVec2 AlwaysSize;
     };
     t->SetVarsDataType<ViewportGeometrySyncVars>();
+    t->GuiFunc = [](ImGuiTestContext* ctx)
+    {
+        ViewportGeometrySyncVars& vars = ctx->GetVars<ViewportGeometrySyncVars>();
+        if (vars.SetPosAlways)
+            ImGui::SetNextWindowPos(vars.AlwaysPos, ImGuiCond_Always);
+        if (vars.SetSizeAlways)
+            ImGui::SetNextWindowSize(vars.AlwaysSize, ImGuiCond_Always);
+        else
+            ImGui::SetNextWindowSize(ImVec2(240.0f, 180.0f), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Geometry Sync Window", NULL, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking);
+        ImGui::TextUnformatted("Mock platform geometry synchronization");
+        ImGui::End();
+    };
     t->TeardownFunc = [](ImGuiTestContext* ctx)
     {
         ViewportGeometrySyncVars& vars = ctx->GetVars<ViewportGeometrySyncVars>();
@@ -257,6 +267,64 @@ void RegisterTests_Viewports(ImGuiTestEngine* e)
             ctx->Yield(6);
             check_synchronized_pos(actual_2);
             IM_CHECK_EQ(state.SetWindowPosCount, 2);
+        }
+
+        // A leftover exact echo must not discard SetNextWindowPos/Size on the following Begin(),
+        // and must not skip the subsequent Platform_Set. TestFunc runs in PreEndFrame (after
+        // WindowSync, before UpdatePlatformWindows). One Yield after SetWindowPos/Size resumes
+        // in the next PreEndFrame: WindowSync has copied the new window rect, the echo Set has
+        // not run yet. Arm SetNext* there so the Begin after that Set is the one that must win
+        // over leftover. A later Yield is only for the platform Set; Set*Count must increment
+        // or a leftover skip is invisible when fields already match.
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 echo_pos = viewport->Pos + ImVec2(50.0f, 20.0f);
+            const ImVec2 next_pos = echo_pos + ImVec2(70.0f, 30.0f);
+            ImGuiAppMockViewportResponse echo;
+            echo.DelayFrames = 0;
+            echo.ApplyRequestedValue = true;
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, echo);
+            ImGui::SetWindowPos(window, echo_pos);
+            ctx->Yield();
+            IM_CHECK(ImGuiApp_MockViewport_GetState(viewport->ID, &state));
+            IM_CHECK_EQ(window->Pos, echo_pos);
+            IM_CHECK_EQ(viewport->Pos, echo_pos);
+            IM_CHECK_EQ(state.SetWindowPosCount, 0);
+
+            vars.SetPosAlways = true;
+            vars.AlwaysPos = next_pos;
+            ctx->Yield();
+            vars.SetPosAlways = false;
+            IM_CHECK_EQ(window->Pos, next_pos);
+            IM_CHECK_EQ(viewport->Pos, next_pos);
+            ctx->Yield();
+            check_synchronized_pos(next_pos);
+            IM_CHECK_EQ(state.SetWindowPosCount, 2);
+
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            const ImVec2 echo_size = viewport->Size + ImVec2(20.0f, 10.0f);
+            const ImVec2 next_size = echo_size + ImVec2(16.0f, 8.0f);
+            ImGuiAppMockViewportResponse size_echo;
+            size_echo.DelayFrames = 0;
+            size_echo.ApplyRequestedValue = true;
+            ImGuiApp_MockViewport_QueueWindowSizeResponse(viewport->ID, size_echo);
+            ImGui::SetWindowSize(window, echo_size);
+            ctx->Yield();
+            IM_CHECK(ImGuiApp_MockViewport_GetState(viewport->ID, &state));
+            IM_CHECK_EQ(window->Size, echo_size);
+            IM_CHECK_EQ(viewport->Size, echo_size);
+            IM_CHECK_EQ(state.SetWindowSizeCount, 0);
+
+            vars.SetSizeAlways = true;
+            vars.AlwaysSize = next_size;
+            ctx->Yield();
+            vars.SetSizeAlways = false;
+            IM_CHECK_EQ(window->Size, next_size);
+            IM_CHECK_EQ(viewport->Size, next_size);
+            ctx->Yield();
+            check_synchronized_size(next_size);
+            IM_CHECK_EQ(state.SetWindowSizeCount, 2);
         }
 
         // A synchronous exact setter echo (Win32 WM_MOVE during Platform_SetWindowPos) must not
