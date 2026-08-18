@@ -259,6 +259,46 @@ void RegisterTests_Viewports(ImGuiTestEngine* e)
             IM_CHECK_EQ(state.SetWindowPosCount, 2);
         }
 
+        // A synchronous exact setter echo (Win32 WM_MOVE during Platform_SetWindowPos) must not
+        // suppress the next imgui-initiated Set. Leftover PlatformRequestMove used to skip it.
+        // Timing: TestFunc runs in PreEndFrame, after WindowSync and before UpdatePlatformWindows.
+        // The second mouse sample is published in that slot so the following NewFrame both
+        // applies the leftover echo and writes a new drag pos before UpdatePlatformWindows.
+        {
+            ImGuiApp_MockViewport_ClearResponses();
+            ctx->WindowFocus(window->ID);
+            ctx->MouseSetViewport(window);
+            ctx->MouseMoveToPos(ctx->GetWindowTitlebarPoint(window->ID));
+            vars.MouseHeld = true;
+            ctx->MouseDown(0);
+            if (g.MovingWindow == NULL)
+                ImGui::StartMouseMovingWindow(window);
+            IM_CHECK(g.MovingWindow && g.MovingWindow->RootWindowDockTree == window->RootWindowDockTree);
+
+            ImGuiAppMockViewportResponse echo;
+            echo.DelayFrames = 0;
+            echo.ApplyRequestedValue = true;
+
+            ctx->MouseTeleportToPos(g.IO.MousePos + ImVec2(40.0f, 20.0f), ImGuiTestOpFlags_NoYield);
+            ctx->Yield();
+
+            ImGuiApp_MockViewport_ResetCounters(viewport->ID);
+            ImGuiApp_MockViewport_QueueWindowPosResponse(viewport->ID, echo);
+            ctx->MouseTeleportToPos(g.IO.MousePos + ImVec2(30.0f, 15.0f), ImGuiTestOpFlags_NoYield);
+            ctx->Yield();
+            IM_CHECK(ImGuiApp_MockViewport_GetState(viewport->ID, &state));
+            IM_CHECK_EQ(state.SetWindowPosCount, 1);
+            const ImVec2 pos_after_echo = state.Pos;
+
+            ctx->Yield();
+            IM_CHECK(ImGuiApp_MockViewport_GetState(viewport->ID, &state));
+            IM_CHECK_NE(state.Pos, pos_after_echo);
+            IM_CHECK_EQ(state.SetWindowPosCount, 2);
+
+            ctx->MouseUp(0);
+            vars.MouseHeld = false;
+        }
+
         // Synchronous adjusted size callbacks need the same request-lifetime behavior as position callbacks.
         {
             ImGuiApp_MockViewport_ClearResponses();
